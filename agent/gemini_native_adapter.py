@@ -238,6 +238,19 @@ def _coerce_content_to_text(content: Any) -> str:
     return str(content)
 
 
+def _decode_data_url(url: Any) -> Optional[Dict[str, str]]:
+    """Split a `data:<mime>;base64,<...>` URL into mimeType + base64 data, or None."""
+    if not isinstance(url, str) or not url.startswith("data:"):
+        return None
+    try:
+        header, encoded = url.split(",", 1)
+        mime = header.split(":", 1)[1].split(";", 1)[0]
+        raw = base64.b64decode(encoded)
+    except Exception:
+        return None
+    return {"mimeType": mime, "data": base64.b64encode(raw).decode("ascii")}
+
+
 def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
     if not isinstance(content, list):
         text = _coerce_content_to_text(content)
@@ -256,23 +269,18 @@ def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
             if isinstance(text, str) and text:
                 parts.append({"text": text})
         elif ptype == "image_url":
-            url = ((item.get("image_url") or {}).get("url") or "")
-            if not isinstance(url, str) or not url.startswith("data:"):
-                continue
-            try:
-                header, encoded = url.split(",", 1)
-                mime = header.split(":", 1)[1].split(";", 1)[0]
-                raw = base64.b64decode(encoded)
-            except Exception:
-                continue
-            parts.append(
-                {
-                    "inlineData": {
-                        "mimeType": mime,
-                        "data": base64.b64encode(raw).decode("ascii"),
-                    }
-                }
-            )
+            inline_data = _decode_data_url((item.get("image_url") or {}).get("url"))
+            if inline_data is not None:
+                parts.append({"inlineData": inline_data})
+        elif ptype == "video_url":
+            # tools/vision_tools.py's video_analyze_tool sends this custom
+            # part type (mirroring image_url) — not an OpenAI-standard shape,
+            # so only Gemini's native inlineData path understands it. Without
+            # this branch the part is silently dropped and the model answers
+            # from the text prompt alone with no video attached (#video-gap).
+            inline_data = _decode_data_url((item.get("video_url") or {}).get("url"))
+            if inline_data is not None:
+                parts.append({"inlineData": inline_data})
     return parts
 
 
