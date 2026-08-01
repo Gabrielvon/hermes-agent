@@ -1409,6 +1409,48 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        # Review-gate guard. When kanban.gate_required_assignees is non-empty,
+        # a ready card owned by one of those assignees is not started until a
+        # card assigned to kanban.gate_assignee depends on it — closing the
+        # create-then-link window in which an orchestrator's worker card runs
+        # before its reviewer exists. Empty (the default) = feature off, so
+        # installs that don't model review gates are unaffected.
+        raw_gate_roles = kanban_cfg.get("gate_required_assignees", None) or []
+        gate_required_assignees = None
+        if isinstance(raw_gate_roles, (list, tuple, set, frozenset)):
+            cleaned = frozenset(
+                str(r).strip() for r in raw_gate_roles if str(r).strip()
+            )
+            gate_required_assignees = cleaned or None
+        elif raw_gate_roles:
+            logger.warning(
+                "kanban dispatcher: kanban.gate_required_assignees=%r is not a "
+                "list; ignoring (review-gate guard stays off)",
+                raw_gate_roles,
+            )
+        gate_assignee = (
+            str(kanban_cfg.get("gate_assignee") or "critic").strip() or "critic"
+        )
+        try:
+            gate_grace_seconds = int(
+                kanban_cfg.get("gate_grace_seconds", _kb.DEFAULT_GATE_GRACE_SECONDS)
+            )
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.gate_grace_seconds=%r; using %d",
+                kanban_cfg.get("gate_grace_seconds"),
+                _kb.DEFAULT_GATE_GRACE_SECONDS,
+            )
+            gate_grace_seconds = _kb.DEFAULT_GATE_GRACE_SECONDS
+        if gate_grace_seconds < 0:
+            gate_grace_seconds = _kb.DEFAULT_GATE_GRACE_SECONDS
+        if gate_required_assignees:
+            logger.info(
+                "kanban dispatcher: review-gate guard on for %d assignee(s); "
+                "gate=%s grace=%ds",
+                len(gate_required_assignees), gate_assignee, gate_grace_seconds,
+            )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1503,6 +1545,9 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    gate_required_assignees=gate_required_assignees,
+                    gate_assignee=gate_assignee,
+                    gate_grace_seconds=gate_grace_seconds,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
