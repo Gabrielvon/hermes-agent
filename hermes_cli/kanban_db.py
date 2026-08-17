@@ -8179,6 +8179,18 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    recovered_from_triage: list[str] = field(default_factory=list)
+    """Task ids auto-promoted ``triage`` -> ``todo`` this tick because they
+    were routed to triage specifically by the no-review-gate loop breaker
+    (see ``skipped_ungated``/``auto_blocked`` above) and a review-gate card
+    now exists. 2026-08-10: found via a real 2-day stuck chain (8 cards on
+    the ``compliance`` board) — ``triage`` is a deliberate human-in-the-loop
+    parking state (see ``block_task``'s ``BLOCK_RECURRENCE_LIMIT`` branch),
+    but nothing ever told a human a card had landed there, so cards whose
+    blocking cause had since resolved sat forever with no automatic path
+    back to ``todo``. This does NOT touch triage cards routed there for any
+    other reason (ADR-19 object-fidelity, a worker's own ``needs_input``) —
+    those still require an actual human decision."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -9666,6 +9678,75 @@ def has_review_gate(
     return row is not None
 
 
+# Auto-recovery for triage cards the no-gate loop breaker parked (2026-08-10).
+# See DispatchResult.recovered_from_triage for the full incident/rationale.
+# Matched on the two stable phrases from the reason string `block_task` writes
+# for THIS specific cause (see its `f"no {gate_assignee} review gate after "`
+# f-string a few hundred lines below) rather than a full-string compare, so a
+# future tweak to the grace-seconds wording doesn't silently stop matching.
+_TRIAGE_GATE_REASON_MARKERS = ("review gate after", "refusing to run ungated")
+
+
+def _recover_gate_stalled_triage(
+    conn: sqlite3.Connection, *, gate_assignee: str = "critic",
+) -> list[str]:
+    """Auto-promote ``triage`` -> ``todo`` for cards the no-gate loop breaker
+    parked there, once a review-gate card has since appeared.
+
+    Narrowly scoped to that ONE cause: only a card whose most recent
+    ``block_loop_detected`` event names "no review gate" is touched. A card
+    in ``triage`` for any other reason (ADR-19 object-fidelity mismatch, a
+    worker's own ``needs_input``) is left exactly where it is — those still
+    need an actual human decision, and this function must not blur that
+    line by loosening the reason match.
+    """
+    recovered: list[str] = []
+    try:
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE status = 'triage' AND block_kind = 'needs_input'"
+        ).fetchall()
+    except sqlite3.Error:
+        return recovered
+    for row in rows:
+        task_id = row["id"]
+        try:
+            evt = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ? "
+                "AND kind = 'block_loop_detected' ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            continue
+        if evt is None:
+            continue
+        try:
+            payload = json.loads(evt["payload"] or "{}")
+        except (ValueError, TypeError):
+            continue
+        reason = str(payload.get("reason") or "")
+        if not all(marker in reason for marker in _TRIAGE_GATE_REASON_MARKERS):
+            continue
+        if not has_review_gate(conn, task_id, gate_assignee):
+            continue
+        try:
+            with write_txn(conn):
+                cur = conn.execute(
+                    "UPDATE tasks SET status = 'todo', block_kind = NULL, "
+                    "block_recurrences = 0 WHERE id = ? AND status = 'triage'",
+                    (task_id,),
+                )
+                if cur.rowcount != 1:
+                    continue
+                _append_event(
+                    conn, task_id, "auto_recovered",
+                    {"reason": "review gate now linked", "from_status": "triage"},
+                )
+        except sqlite3.Error:
+            continue
+        recovered.append(task_id)
+    return recovered
+
+
 # Object-fidelity guard (ADR-19, 2026-08-04). See DECISIONS.md D-63 for the
 # full design discussion; the short version: the 2026-08-03 半鞅→半鞍 incident
 # showed that ADR-6's fact-check gates verify "is this information true", not
@@ -10247,6 +10328,15 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    result.recovered_from_triage = _recover_gate_stalled_triage(
+        conn, gate_assignee=gate_assignee,
+    )
+    if result.recovered_from_triage:
+        # Fold straight into this tick rather than waiting for the next one:
+        # a recovered card with no parents is immediately ready to run, and
+        # recompute_ready() only just ran above (it never looks at
+        # ``triage``, so it could not have picked these up itself).
+        result.promoted += recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
