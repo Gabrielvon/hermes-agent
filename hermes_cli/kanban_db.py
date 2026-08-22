@@ -8116,6 +8116,22 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_ungated: list[str] = field(default_factory=list)
+    """Ready task ids deferred this tick because their assignee is listed in
+    ``kanban.gate_required_assignees`` but no review-gate card depends on them
+    yet.
+
+    Closes a create-then-link race: an orchestrator that creates the worker
+    card and only afterwards links its gate leaves a window in which the
+    dispatcher can claim and run the card ungated, so the output is produced
+    (and delivered) before anything reviews it. Prompt instructions alone do
+    not close it — the orchestrator's own report of what it did is not
+    evidence that it did it in that order.
+
+    NOT operator-actionable on its own: the gate is normally linked within the
+    same turn, so the card simply starts one tick later. Only if the gate is
+    still missing after ``kanban.gate_grace_seconds`` is the card auto-blocked
+    (it then appears in ``auto_blocked`` instead, which IS actionable)."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -9612,6 +9628,38 @@ def check_respawn_guard(
     return None
 
 
+# Default grace before an ungated card is auto-blocked rather than deferred.
+# Sized to comfortably span several dispatcher ticks (default interval 60s):
+# the orchestrator normally links the gate in the same turn it creates the
+# card, so the common case is one deferred tick, not five minutes of waiting.
+DEFAULT_GATE_GRACE_SECONDS = 300
+
+
+def has_review_gate(
+    conn: sqlite3.Connection, task_id: str, gate_assignee: str = "critic",
+) -> bool:
+    """True when some card assigned to ``gate_assignee`` depends on ``task_id``.
+
+    The review gate is modelled as a CHILD card blocked-by the work card, so a
+    gated worker card is one that appears as ``parent_id`` in ``task_links``
+    with a gate-assignee child. Returns False on any error — callers treat an
+    unreadable link graph as "cannot prove a gate exists", which is the
+    fail-closed reading.
+    """
+    if not task_id or not gate_assignee:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks t ON t.id = l.child_id "
+            "WHERE l.parent_id = ? AND t.assignee = ? "
+            "AND t.status != 'archived' LIMIT 1",
+            (task_id, gate_assignee),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
 def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
@@ -9894,6 +9942,9 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    gate_required_assignees: Optional[frozenset] = None,
+    gate_assignee: str = "critic",
+    gate_grace_seconds: int = DEFAULT_GATE_GRACE_SECONDS,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -9929,6 +9980,9 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            gate_required_assignees=gate_required_assignees,
+            gate_assignee=gate_assignee,
+            gate_grace_seconds=gate_grace_seconds,
         )
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
@@ -9949,6 +10003,9 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 reconcile_orphans=reconcile_orphans,
+                gate_required_assignees=gate_required_assignees,
+                gate_assignee=gate_assignee,
+                gate_grace_seconds=gate_grace_seconds,
             )
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
@@ -9976,6 +10033,9 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    gate_required_assignees: Optional[frozenset] = None,
+    gate_assignee: str = "critic",
+    gate_grace_seconds: int = DEFAULT_GATE_GRACE_SECONDS,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -10108,8 +10168,9 @@ def _dispatch_once_locked(
             )
             spawn_budget = 1
 
+    # created_at is selected for the review-gate guard's grace-period check.
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, created_at FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -10256,6 +10317,68 @@ def _dispatch_once_locked(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
+        # Review-gate guard: refuse to start a card whose output is supposed to
+        # be reviewed until the reviewing card actually exists.
+        #
+        # The failure this closes is a create-then-link race. An orchestrator
+        # that creates the worker card first and links its gate a moment later
+        # leaves a window where the dispatcher claims and runs the card with
+        # nothing gating it; by the time the gate appears the work is done and
+        # already delivered. Ordering instructions in a prompt cannot close
+        # this — the orchestrator's own account of what it did is not evidence
+        # of the order it did it in. Only the dispatcher can refuse to start.
+        #
+        # Deferring (not blocking) is the common path: the gate is normally
+        # linked in the same turn, so the card starts one tick later and
+        # nothing is lost. Blocking is reserved for cards still ungated after
+        # the grace period, where the gate is genuinely never coming and a
+        # human needs to see it — silently running it ungated, or silently
+        # parking it forever, are both worse.
+        if gate_required_assignees and row_assignee in gate_required_assignees:
+            if not has_review_gate(conn, row["id"], gate_assignee):
+                age = 0
+                try:
+                    age = int(time.time()) - int(row["created_at"] or 0)
+                except (TypeError, ValueError):
+                    age = 0
+                if age < max(0, int(gate_grace_seconds)):
+                    result.skipped_ungated.append(row["id"])
+                    continue
+                reason = (
+                    f"no {gate_assignee} review gate after "
+                    f"{gate_grace_seconds}s — refusing to run ungated. "
+                    f"Create a {gate_assignee} card blocked-by this one, then "
+                    f"unblock."
+                )
+                if not dry_run:
+                    try:
+                        # kind=needs_input, NOT dependency. `dependency` means
+                        # "a parent card will finish and free me", and routes
+                        # to `todo` so recompute_ready can promote it — which
+                        # here would loop forever: the card has no unfinished
+                        # parent, so it is promoted straight back to `ready`,
+                        # re-blocked next tick, every tick. The gate card does
+                        # not exist and nothing will create it on its own, so
+                        # this genuinely needs someone to act: `needs_input`
+                        # lands it in the human bucket and participates in the
+                        # unblock-loop breaker.
+                        block_task(
+                            conn, row["id"], reason=reason, kind="needs_input",
+                        )
+                    except Exception:
+                        _log.debug(
+                            "kanban dispatch: failed to auto-block ungated task %s",
+                            row["id"], exc_info=True,
+                        )
+                        result.skipped_ungated.append(row["id"])
+                        continue
+                _log.warning(
+                    "kanban dispatch: task %s (%s) has no %s gate after %ds; "
+                    "blocked instead of running ungated",
+                    row["id"], row_assignee, gate_assignee, age,
+                )
+                result.auto_blocked.append(row["id"])
+                continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
