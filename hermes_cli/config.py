@@ -2216,11 +2216,17 @@ def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
     if not issues:
         return
 
-    lines = ["\033[33m⚠ Config issues detected in config.yaml:\033[0m"]
+    lines = [color("⚠ Config issues detected in config.yaml:", Colors.YELLOW, stream=sys.stderr)]
     for ci in issues:
-        marker = "\033[31m✗\033[0m" if ci.severity == "error" else "\033[33m⚠\033[0m"
+        marker = (
+            color("✗", Colors.RED, stream=sys.stderr)
+            if ci.severity == "error"
+            else color("⚠", Colors.YELLOW, stream=sys.stderr)
+        )
         lines.append(f"  {marker} {ci.message}")
-    lines.append("  \033[2mRun 'hermes doctor' for fix suggestions.\033[0m")
+    lines.append(
+        "  " + color("Run 'hermes doctor' for fix suggestions.", Colors.DIM, stream=sys.stderr)
+    )
     sys.stderr.write("\n".join(lines) + "\n\n")
 
 
@@ -2243,25 +2249,30 @@ def warn_deprecated_cwd_env_vars() -> None:
     lines: list[str] = []
     if messaging_cwd:
         lines.append(
-            f"  \033[33m⚠\033[0m MESSAGING_CWD={messaging_cwd} found in .env — "
-            f"this is deprecated."
+            f"  {color('⚠', Colors.YELLOW, stream=sys.stderr)} "
+            f"MESSAGING_CWD={messaging_cwd} found in .env — this is deprecated."
         )
     if terminal_cwd_env:
         lines.append(
-            f"  \033[33m⚠\033[0m TERMINAL_CWD={terminal_cwd_env} found in .env — "
-            f"this is deprecated."
+            f"  {color('⚠', Colors.YELLOW, stream=sys.stderr)} "
+            f"TERMINAL_CWD={terminal_cwd_env} found in .env — this is deprecated."
         )
     if lines:
         from hermes_constants import display_hermes_home
 
         hint_path = display_hermes_home()
-        lines.insert(0, "\033[33m⚠ Deprecated .env settings detected:\033[0m")
-        lines.append(
-            "  \033[2mMove to config.yaml instead:  "
-            "terminal:\\n    cwd: /your/project/path\033[0m"
+        lines.insert(
+            0, color("⚠ Deprecated .env settings detected:", Colors.YELLOW, stream=sys.stderr)
         )
         lines.append(
-            f"  \033[2mThen remove the old entries from {hint_path}/.env\033[0m"
+            color(
+                "  Move to config.yaml instead:  terminal:\\n    cwd: /your/project/path",
+                Colors.DIM,
+                stream=sys.stderr,
+            )
+        )
+        lines.append(
+            "  " + color(f"Then remove the old entries from {hint_path}/.env", Colors.DIM, stream=sys.stderr)
         )
         sys.stderr.write("\n".join(lines) + "\n\n")
 
